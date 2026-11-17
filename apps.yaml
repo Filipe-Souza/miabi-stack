@@ -1,0 +1,128 @@
+# The three n8n processes. n8n 2.48.4 was the image behind n8nio/n8n:stable on 2026-11-17.
+# n8n, n8n-worker and n8n-runners must always run the same version: bump all three tags together.
+#
+# Flow: a trigger or webhook hits n8n, which queues the execution in Redis. n8n-worker runs it
+# against Postgres and sends Code-node scripts to n8n-runners, the sandbox.
+
+# n8n's home directory: instance settings, event logs, community nodes installed from the UI.
+apiVersion: miabi.io/v1
+kind: Volume
+metadata:
+  name: n8n-data
+spec:
+  size: 2Gi
+---
+# Main instance: editor UI, REST API, triggers, incoming webhooks. Executions go to the worker.
+apiVersion: miabi.io/v1
+kind: Application
+metadata:
+  name: n8n
+spec:
+  image: n8nio/n8n
+  tag: "2.48.4"
+  stack: n8n
+  deployment:
+    # Stop before start: one main at a time (two would both fire scheduled triggers),
+    # and only one container on the volume.
+    strategy: recreate
+  ports:
+    - name: http
+      container: 5678
+      scheme: http
+      externalAccess: true   # public HTTPS at a Miabi-generated <label>.<base-domain>
+  healthcheck:
+    type: http
+    path: /healthz
+    port: 5678
+    intervalSeconds: 15
+    startPeriodSeconds: 120  # the first boot runs the database migrations
+  env:
+    # N8N_HOST, N8N_EDITOR_BASE_URL and N8N_WEBHOOK_URL come from the Stack (stack.yaml).
+    # Don't set them here: an app's own variable would override the stack's.
+    N8N_PROTOCOL: https
+    N8N_PORT: "5678"
+    N8N_PROXY_HOPS: "1"
+    GENERIC_TIMEZONE: UTC
+    TZ: UTC
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: "{{ .databases.n8n-postgres.host }}"
+    DB_POSTGRESDB_PORT: "{{ .databases.n8n-postgres.port }}"
+    DB_POSTGRESDB_DATABASE: "{{ .databases.n8n-postgres.name }}"
+    DB_POSTGRESDB_USER: "{{ .databases.n8n-postgres.user }}"
+    DB_POSTGRESDB_PASSWORD: "{{ .databases.n8n-postgres.password }}"
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: "{{ .databases.n8n-redis.host }}"
+    QUEUE_BULL_REDIS_PORT: "{{ .databases.n8n-redis.port }}"
+    QUEUE_BULL_REDIS_PASSWORD: "{{ .databases.n8n-redis.password }}"
+    OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+    N8N_RUNNERS_MODE: external
+    N8N_RUNNERS_AUTH_TOKEN: "{{ .secrets.n8n-runners-auth-token }}"
+    N8N_ENCRYPTION_KEY: "{{ .secrets.n8n-encryption-key }}"
+  mounts:
+    - volume: n8n-data
+      path: /home/node/.n8n
+  resources:
+    memory: 1Gi
+    cpu: "1"
+---
+# Runs every execution, manual ones included. Stateless, so it can roll.
+# Don't add replicas: n8n-runners pairs with one worker. Scale with another
+# worker + runners pair, or raise the worker's concurrency.
+apiVersion: miabi.io/v1
+kind: Application
+metadata:
+  name: n8n-worker
+spec:
+  image: n8nio/n8n
+  tag: "2.48.4"
+  stack: n8n
+  command: ["worker"]
+  deployment:
+    strategy: rolling
+  healthcheck:
+    type: http
+    path: /healthz           # served because QUEUE_HEALTH_CHECK_ACTIVE=true
+    port: 5678
+    intervalSeconds: 15
+    startPeriodSeconds: 60
+  env:
+    N8N_PROTOCOL: https
+    GENERIC_TIMEZONE: UTC
+    TZ: UTC
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: "{{ .databases.n8n-postgres.host }}"
+    DB_POSTGRESDB_PORT: "{{ .databases.n8n-postgres.port }}"
+    DB_POSTGRESDB_DATABASE: "{{ .databases.n8n-postgres.name }}"
+    DB_POSTGRESDB_USER: "{{ .databases.n8n-postgres.user }}"
+    DB_POSTGRESDB_PASSWORD: "{{ .databases.n8n-postgres.password }}"
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: "{{ .databases.n8n-redis.host }}"
+    QUEUE_BULL_REDIS_PORT: "{{ .databases.n8n-redis.port }}"
+    QUEUE_BULL_REDIS_PASSWORD: "{{ .databases.n8n-redis.password }}"
+    QUEUE_HEALTH_CHECK_ACTIVE: "true"
+    N8N_RUNNERS_MODE: external
+    N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+    N8N_RUNNERS_AUTH_TOKEN: "{{ .secrets.n8n-runners-auth-token }}"
+    N8N_ENCRYPTION_KEY: "{{ .secrets.n8n-encryption-key }}"
+  resources:
+    memory: 2Gi
+    cpu: "2"
+---
+# Code-node sandbox for n8n-worker. It holds only the runner token: no database password,
+# no encryption key.
+apiVersion: miabi.io/v1
+kind: Application
+metadata:
+  name: n8n-runners
+spec:
+  image: n8nio/runners
+  tag: "2.48.4"
+  stack: n8n
+  deployment:
+    strategy: rolling
+  env:
+    N8N_RUNNERS_TASK_BROKER_URI: http://n8n-worker:5679
+    N8N_RUNNERS_AUTH_TOKEN: "{{ .secrets.n8n-runners-auth-token }}"
+  resources:
+    memory: 1Gi
+    cpu: "1"

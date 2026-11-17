@@ -1,0 +1,29 @@
+# Managed databases. Miabi provisions them, generates their credentials into the vault, and
+# hands them to the apps through {{ .databases.<name>.* }} in apps.yaml. Backups and version
+# upgrades are managed from the Databases page.
+#
+# Caution: removing one of these from Git while the Git source has Prune enabled deletes the
+# database and its data.
+apiVersion: miabi.io/v1
+kind: Database
+metadata:
+  name: n8n-postgres
+spec:
+  engine: postgres
+  version: "17-alpine"   # n8n supports PostgreSQL 16-18. Changing it later is refused; use a version upgrade.
+  instance: dedicated
+  resources:
+    memory: 1Gi
+    cpu: "1"
+---
+# Execution queue for n8n queue mode. Redis is always a dedicated instance, with a password.
+apiVersion: miabi.io/v1
+kind: Database
+metadata:
+  name: n8n-redis
+spec:
+  engine: redis
+  version: "8-alpine"
+  resources:
+    memory: 256Mi
+    cpu: "0.25"
