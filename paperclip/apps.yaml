@@ -1,0 +1,58 @@
+# Paperclip 2026.1106.0, the newest release on 2026-11-17 and the image behind :latest then.
+# The image ships the Claude Code, Codex, OpenCode and Gemini CLIs. Agents run inside this
+# container, which is why it gets 2 vCPU / 4 GiB (Paperclip's own ECS sizing).
+
+# PAPERCLIP_HOME: instance config, the secrets master key, uploaded assets, agent workspaces.
+# size is quota accounting only. Raise it as workspaces grow.
+apiVersion: miabi.io/v1
+kind: Volume
+metadata:
+  name: paperclip-data
+spec:
+  size: 20Gi
+---
+apiVersion: miabi.io/v1
+kind: Application
+metadata:
+  name: paperclip
+spec:
+  image: ghcr.io/paperclipai/paperclip
+  tag: "2026.1106.0"
+  stack: paperclip
+  deployment:
+    # Stop before start: one server per data directory and database, never two side by side.
+    strategy: recreate
+  ports:
+    - name: http
+      container: 3100
+      scheme: http
+      externalAccess: true   # public HTTPS at a Miabi-generated <label>.<base-domain>
+  healthcheck:
+    type: http
+    path: /api/health
+    port: 3100
+    intervalSeconds: 15
+    startPeriodSeconds: 180  # migrations and Runner startup on boot
+  env:
+    # PAPERCLIP_PUBLIC_URL comes from the Stack (stack.yaml). Don't set it here: an app's own
+    # variable would override the stack's.
+    #
+    # authenticated/public: login required, auth rate limiting on, and the first admin is created
+    # by a one-time CLI invite. Not authenticated/private: there, whoever opens the URL first can
+    # claim the instance, and generated hostnames show up in public certificate-transparency logs
+    # within minutes.
+    PAPERCLIP_DEPLOYMENT_MODE: authenticated
+    PAPERCLIP_DEPLOYMENT_EXPOSURE: public
+    HOST: 0.0.0.0
+    PORT: "3100"
+    SERVE_UI: "true"
+    PAPERCLIP_HOME: /paperclip
+    DATABASE_URL: "{{ .databases.paperclip-postgres.uri }}"
+    BETTER_AUTH_SECRET: "{{ .secrets.paperclip-better-auth-secret }}"
+    PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "{{ .secrets.paperclip-tool-action-signing-secret }}"
+  mounts:
+    - volume: paperclip-data
+      path: /paperclip
+  resources:
+    memory: 4Gi
+    cpu: "2"

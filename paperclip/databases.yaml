@@ -1,0 +1,18 @@
+# Managed PostgreSQL. Paperclip's public mode refuses its embedded database and requires an
+# external postgres:// DATABASE_URL, which apps.yaml takes from here.
+#
+# Back this up together with the paperclip-data volume: Paperclip keeps its secrets master key
+# there, and the database's stored secrets can't be decrypted without it.
+#
+# Caution: removing this from Git while the Git source has Prune enabled deletes the database.
+apiVersion: miabi.io/v1
+kind: Database
+metadata:
+  name: paperclip-postgres
+spec:
+  engine: postgres
+  version: "17-alpine"   # what Paperclip's own Compose file runs. Changing it later is refused; use a version upgrade.
+  instance: dedicated
+  resources:
+    memory: 1Gi
+    cpu: "1"
