@@ -1,6 +1,12 @@
 # Paperclip 2026.1106.0, the newest release on 2026-11-17 and the image behind :latest then.
 # The image ships the Claude Code, Codex, OpenCode and Gemini CLIs. Agents run inside this
 # container, which is why it gets 2 vCPU / 4 GiB (Paperclip's own ECS sizing).
+#
+# PAPERCLIP_PUBLIC_URL isn't written anywhere: it's read from the deployment at startup. Miabi
+# generates the app's public hostname (externalAccess below) and has no variable that passes it
+# into the app, so public-url.mjs asks the control plane's API for it on every boot:
+#   GET /api/v1/workspaces/{workspace}/apps/paperclip/external-access
+# It needs a read-only API key, the vault secret paperclip-miabi-api-token (see README.md).
 
 # PAPERCLIP_HOME: instance config, the secrets master key, uploaded assets, agent workspaces.
 # size is quota accounting only. Raise it as workspaces grow.
@@ -11,6 +17,55 @@ metadata:
 spec:
   size: 20Gi
 ---
+# Startup helper, mounted read-only at /opt/miabi/public-url.mjs. Prints the app's generated URL
+# (https://<label>.<base-domain>), retrying while the control plane or the route isn't ready yet.
+apiVersion: miabi.io/v1
+kind: Config
+metadata:
+  name: paperclip-public-url
+spec:
+  data:
+    public-url.mjs: |
+      const env = (name, fallback) => {
+        const value = process.env[name] || fallback;
+        if (!value) {
+          console.error(`public-url: ${name} is not set`);
+          process.exit(1);
+        }
+        return value;
+      };
+      const server = env("MIABI_SERVER").replace(/\/+$/, "");
+      const workspace = encodeURIComponent(env("MIABI_WORKSPACE"));
+      const app = encodeURIComponent(env("MIABI_APP", "paperclip"));
+      const port = Number(env("MIABI_PORT", "3100"));
+      const token = env("MIABI_API_TOKEN");
+      const endpoint = `${server}/api/v1/workspaces/${workspace}/apps/${app}/external-access`;
+      const attempts = 20;
+
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          const res = await fetch(endpoint, {
+            headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+            signal: AbortSignal.timeout(10000),
+          });
+          const body = await res.json().catch(() => null);
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status} ${JSON.stringify(body?.error ?? "")}`);
+          }
+          const access = body?.data ?? {};
+          const hit = (access.ports ?? []).find((p) => p.port === port);
+          if (hit?.url) {
+            process.stdout.write(hit.url.replace(/\/+$/, ""));
+            process.exit(0);
+          }
+          throw new Error(`no external-access route for port ${port} yet (enabled=${access.enabled})`);
+        } catch (err) {
+          console.error(`public-url: attempt ${attempt}/${attempts}: ${err.message}`);
+          if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+      }
+      process.exit(1);
+---
 apiVersion: miabi.io/v1
 kind: Application
 metadata:
@@ -19,6 +74,17 @@ spec:
   image: ghcr.io/paperclipai/paperclip
   tag: "2026.1106.0"
   stack: paperclip
+  # The image's entrypoint (tini → docker-entrypoint.sh) still runs first and drops to the node
+  # user. Then: look up the public URL, drop the API key from the environment so the server and
+  # the agents it spawns never see it, and start the server as the image normally does.
+  command:
+    - sh
+    - -c
+    - >-
+      PAPERCLIP_PUBLIC_URL="$(node /opt/miabi/public-url.mjs)" &&
+      export PAPERCLIP_PUBLIC_URL &&
+      unset MIABI_API_TOKEN &&
+      exec node server/dist-runtime/index.mjs
   deployment:
     # Stop before start: one server per data directory and database, never two side by side.
     strategy: recreate
@@ -32,11 +98,8 @@ spec:
     path: /api/health
     port: 3100
     intervalSeconds: 15
-    startPeriodSeconds: 180  # migrations and Runner startup on boot
+    startPeriodSeconds: 180  # URL lookup, migrations and Runner startup on boot
   env:
-    # PAPERCLIP_PUBLIC_URL comes from the Stack (stack.yaml). Don't set it here: an app's own
-    # variable would override the stack's.
-    #
     # authenticated/public: login required, auth rate limiting on, and the first admin is created
     # by a one-time CLI invite. Not authenticated/private: there, whoever opens the URL first can
     # claim the instance, and generated hostnames show up in public certificate-transparency logs
@@ -50,9 +113,19 @@ spec:
     DATABASE_URL: "{{ .databases.paperclip-postgres.uri }}"
     BETTER_AUTH_SECRET: "{{ .secrets.paperclip-better-auth-secret }}"
     PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "{{ .secrets.paperclip-tool-action-signing-secret }}"
+    # For the public URL lookup. Set the first two once to your install: they're fixed facts
+    # about the panel and workspace, not anything the deployment generates.
+    MIABI_SERVER: https://miabi.acharfil.me   # the Miabi panel URL (MIABI_WEB_URL)
+    MIABI_WORKSPACE: system                   # this workspace's name
+    MIABI_APP: paperclip
+    MIABI_PORT: "3100"
+    MIABI_API_TOKEN: "{{ .secrets.paperclip-miabi-api-token }}"
   mounts:
     - volume: paperclip-data
       path: /paperclip
+    - config: paperclip-public-url
+      key: public-url.mjs
+      path: /opt/miabi/public-url.mjs
   resources:
     memory: 4Gi
     cpu: "2"
